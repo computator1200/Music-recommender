@@ -99,7 +99,7 @@ def fetch_user_liked_songs(sp):
     
     return liked_songs
 
-def fetch_random_songs_directly(sp, num_songs=20):
+def fetch_random_songs_directly(sp, num_songs=100):
     """Fetch random songs directly without genre seeds"""
     if not sp:
         return []
@@ -116,7 +116,7 @@ def fetch_random_songs_directly(sp, num_songs=20):
         try:
             # Add a random offset for more variety
             offset = random.randint(0, 500)
-            results = sp.search(q=char, type='track', limit=100, offset=offset)
+            results = sp.search(q=char, type='track', limit=50, offset=offset)
             
             if results and 'tracks' in results and 'items' in results['tracks']:
                 for track in results['tracks']['items']:
