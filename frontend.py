@@ -147,7 +147,7 @@ def fetch_random_songs_directly(sp, num_songs=100):
     
     return collected_songs
 
-def fetch_recommendations_from_tracks(sp, tracks, num_songs=20):
+def fetch_spotify_recommendations_from_tracks(sp, tracks, num_songs=10):
     """Fetch recommendations based on seed tracks"""
     if not sp or not tracks:
         return []
@@ -156,7 +156,9 @@ def fetch_recommendations_from_tracks(sp, tracks, num_songs=20):
     
     # Use up to 5 tracks as seeds (Spotify limit)
     seed_tracks = random.sample(tracks, min(5, len(tracks)))
-    seed_ids = [track['id'] for track in seed_tracks]
+    
+    # Format track IDs as proper Spotify URIs
+    seed_ids = [f"spotify:track:{track['id']}" for track in seed_tracks]
     
     try:
         results = sp.recommendations(seed_tracks=seed_ids, limit=num_songs)
@@ -191,7 +193,7 @@ def fetch_random_songs(sp, num_songs=20):
     # If we don't have enough songs yet, try getting recommendations
     # based on the songs we already found
     if initial_songs:
-        recommended_songs = fetch_recommendations_from_tracks(sp, initial_songs, num_songs - len(initial_songs))
+        recommended_songs = fetch_spotify_recommendations_from_tracks(sp, initial_songs, num_songs - len(initial_songs))
         
         # Combine and filter out duplicates
         all_song_ids = [song['id'] for song in initial_songs]
@@ -269,27 +271,18 @@ def main():
         # Fetch songs for display if not already loaded
         if not st.session_state.displayed_songs:
             with st.spinner("Fetching songs for recommendation..."):
-                # First try to use user's liked songs for recommendations
-                if st.session_state.user_liked_songs:
-                    st.session_state.displayed_songs = fetch_recommendations_from_tracks(
-                        sp, 
-                        st.session_state.user_liked_songs,
-                        num_songs=20
-                    )
-                
-                # If that didn't work, or didn't return enough songs, add some random ones
-                if len(st.session_state.displayed_songs) < 20:
-                    remaining = 20 - len(st.session_state.displayed_songs)
-                    st.session_state.displayed_songs.extend(
-                        fetch_random_songs(sp, num_songs=remaining)
-                    )
-                
+                extra_songs = []
+                if len(st.session_state.user_liked_songs) < 40:
+                    extra_songs = fetch_random_songs(sp, 30)
+                    st.session_state.displayed_songs = extra_songs + st.session_state.user_liked_songs
+                else:
+                    st.session_state.displayed_songs = st.session_state.user_liked_songs[:40]
                 # Initialize selection and rating arrays
                 liked_song_ids = [song['id'] for song in st.session_state.user_liked_songs]
                 st.session_state.selections = [song['id'] in liked_song_ids for song in st.session_state.displayed_songs]
                 st.session_state.ratings = [6 if song['id'] in liked_song_ids else 0 for song in st.session_state.displayed_songs]
             
-            st.success(f"Loaded {len(st.session_state.displayed_songs)} songs for recommendation")
+            st.success(f"Loaded {len(st.session_state.user_liked_songs)} liked songs for recommendation and {len(extra_songs)} random songs")
     
     # Sidebar for recommendation method
     with st.sidebar:
