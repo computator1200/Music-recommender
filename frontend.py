@@ -52,11 +52,14 @@ def authenticate_spotify():
         
         # Display login button
         st.markdown(f"[![Login with Spotify]"
-                   f"(https://img.shields.io/badge/Login%20with-Spotify-1DB954?style=for-the-badge&logo=spotify&logoColor=white)]"
-                   f"({st.session_state.auth_url})")
+               f"(https://img.shields.io/badge/Login%20with-Spotify-1DB954?style=for-the-badge&logo=spotify&logoColor=white)]"
+               f"({st.session_state.auth_url})")
         
-        # User needs to enter the code from the redirect URL
-        auth_code = st.text_input("Enter the code from the URL you were redirected to:")
+        # Get the authorization code from the URL after redirect
+        auth_code = None
+        if "code" in st.query_params:
+            auth_code = st.query_params["code"]
+            st.info("Detected redirect from Spotify. Processing authentication...")
         
         if auth_code:
             try:
@@ -77,7 +80,7 @@ def fetch_user_liked_songs(sp):
         return []
     
     liked_songs = []
-    results = sp.current_user_saved_tracks(limit=20)
+    results = sp.current_user_saved_tracks(limit=50)
     
     while results:
         for item in results['items']:
@@ -113,7 +116,7 @@ def fetch_random_songs_directly(sp, num_songs=20):
         try:
             # Add a random offset for more variety
             offset = random.randint(0, 500)
-            results = sp.search(q=char, type='track', limit=50, offset=offset)
+            results = sp.search(q=char, type='track', limit=100, offset=offset)
             
             if results and 'tracks' in results and 'items' in results['tracks']:
                 for track in results['tracks']['items']:
@@ -251,7 +254,7 @@ def create_song_image(index, size=(120, 120)):
     return img_byte_arr.getvalue()
 
 def main():
-    st.title("Song Recommendation System")
+    st.title("Music Recommendation System")
     
     # Spotify authentication section
     sp = authenticate_spotify()
@@ -377,7 +380,9 @@ def main():
                 })
         
         with st.sidebar:
-            if not selected_songs:
+            if not st.session_state.spotify_authenticated:
+                st.error("Please authenticate with Spotify to get recommendations.")
+            elif not selected_songs:
                 st.error("Please select at least one song to get recommendations.")
             else:
                 selected_songs_str = ", ".join([f"{s['name']} by {s['artist']} (Rating: {s['rating']})" for s in selected_songs[:3]])
