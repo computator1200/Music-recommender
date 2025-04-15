@@ -6,6 +6,8 @@ import spotipy
 import requests
 import random
 import time
+import socket
+import json
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 import os
@@ -255,6 +257,59 @@ def create_song_image(index, size=(120, 120)):
     img.save(img_byte_arr, format='PNG')
     return img_byte_arr.getvalue()
 
+def connect_to_recommendation_server(host='localhost', port=8765):
+    """Connect to backend recommendation server"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+        return sock
+    except Exception as e:
+        st.error(f"Failed to connect to recommendation server: {e}")
+        return None
+
+def get_recommendations_from_server(method, selected_songs):
+    """Send song selection and get recommendations from server"""
+    if not selected_songs:
+        return None
+    
+    # Create payload
+    payload = {
+        'method': method,
+        'songs': [{'id': song['id'], 'rating': song['rating']} for song in selected_songs]
+    }
+    
+    # Convert to JSON
+    json_payload = json.dumps(payload)
+    
+    try:
+        # Connect to server
+        sock = connect_to_recommendation_server()
+        if not sock:
+            return None
+        
+        # Send data
+        sock.sendall(json_payload.encode('utf-8'))
+        
+        # Receive response
+        response = b""
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            response += data
+        
+        # Close connection
+        sock.close()
+        
+        # Parse response
+        if response:
+            return json.loads(response.decode('utf-8'))
+        
+    except Exception as e:
+        st.error(f"Error communicating with recommendation server: {e}")
+    
+    return None
+
 def main():
     st.title("Music Recommendation System")
     
@@ -383,6 +438,68 @@ def main():
                     selected_songs_str += f" and {len(selected_songs)-3} more"
                     
                 st.success(f"**Recommendations requested!**\n\nUsing method: {method}\n\nSelected songs: {selected_songs_str}")
+                
+                # Send to recommendation server and get results
+                with st.spinner("Getting recommendations from server..."):
+                    recommendations = get_recommendations_from_server(method, selected_songs)
+                
+                if recommendations:
+                    st.session_state.recommendations = recommendations
+                    st.success(f"Received {len(recommendations)} recommendations!")
+
+                    # Display recommendations
+                    st.header("Recommended Songs")
+                    
+                    # Create columns for recommendations
+                    rec_cols_per_row = 4
+                    
+                    # Get Spotify client for fetching song details if needed
+                    sp = st.session_state.spotify_client
+                    
+                    # Display recommendations in a grid
+                    for rec_row in range(0, len(st.session_state.recommendations), rec_cols_per_row):
+                        rec_cols = st.columns(rec_cols_per_row)
+                        
+                        for j, rec_col in enumerate(rec_cols):
+                            rec_idx = rec_row + j
+                            
+                            if rec_idx < len(st.session_state.recommendations):
+                                rec = st.session_state.recommendations[rec_idx]
+                                
+                                with rec_col:
+                                    # Try to get image from Spotify if we have a client
+                                    image_url = rec.get('image_url')
+                                    if not image_url and sp and 'id' in rec:
+                                        try:
+                                            track_data = sp.track(rec['id'])
+                                            if track_data and track_data['album']['images']:
+                                                image_url = track_data['album']['images'][0]['url']
+                                        except:
+                                            pass
+                                    
+                                    # Display image and details
+                                    st.image(
+                                        get_song_image_from_url(image_url),
+                                        caption=f"{rec['name']}\n{rec['artist']}",
+                                        use_container_width=True
+                                    )
+                                    
+                                    # Additional details
+                                    detail_text = f"Year: {rec.get('year', 'Unknown')}"
+                                    if 'popularity' in rec:
+                                        pop_value = int(rec['popularity']) if isinstance(rec['popularity'], (int, float)) else 0
+                                        detail_text += f" | Popularity: {pop_value}/100"
+                                    
+                                    st.caption(detail_text)
+                                    
+                                    # Add go-to Spotify button
+                                    if 'id' in rec:
+                                        st.markdown(f"[Listen on Spotify](https://open.spotify.com/track/{rec['id']})")
+                                    else:
+                                        st.markdown("No Spotify link available.")
+
+                else:
+                    st.error("Failed to get recommendations. Make sure the backend server is running.")
 
 if __name__ == "__main__":
     main()
