@@ -279,14 +279,26 @@ model.compile(optimizer=tf.keras.optimizers.Adagrad(0.1))
 history = model.fit(
     train_dataset,
     validation_data=test_dataset,
-    epochs=5
+    epochs=3
 )
 
 # Evaluate on the test set
 metrics = model.evaluate(test_dataset, return_dict=True)
 print(f"Evaluation metrics: {metrics}")
 
-model.save('models/metadata_two_tower_deep_retrieval.keras')
+def train_model_on_new_songs(new_songs):
+    """
+    Train the model on new songs
+    
+    Args:
+        model: The MusicModel instance
+        new_songs: DataFrame of new songs to train on
+    """
+    # Create a TensorFlow dataset from the new songs
+    new_dataset = create_tf_dataset(new_songs)
+    
+    # Train the model on the new dataset
+    model.fit(new_dataset, epochs=1)
 
 # %%
 # Create a mapping from string IDs to integer IDs
@@ -577,92 +589,229 @@ def recommend_from_spotify_track(spotify_track_id, k=10):
 
 import socket
 import json
-import time
-import logging
-from datetime import datetime
+import threading
 
-# Set up logging
-logging.basicConfig(
-    filename='server.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logging.info("Server started.")
-
-# create a socket
-
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind(('localhost', 12345))
-server_socket.listen(5)
-logging.info("Server is listening for connections...")
-
-def handle_client(client_socket):
-    try:
-        # Receive data from the client
-        request = client_socket.recv(1024).decode('utf-8')
-        logging.info(f"Received request: {request}")
-        
-        # Parse the request
-        request_data = json.loads(request)
-        action = request_data.get('action')
-        
-        if action == 'recommend':
-            song_id = request_data.get('song_id')
-            k = request_data.get('k', 10)
-            recommendations = get_recommendations(song_id, k)
-            response = {
-                'status': 'success',
-                'recommendations': recommendations
-            }
-        elif action == 'recommend_with_audio':
-            audio_file_path = request_data.get('audio_file_path')
-            k = request_data.get('k', 10)
-            recommendations = recommend_with_audio(audio_file_path, k)
-            response = {
-                'status': 'success',
-                'recommendations': recommendations
-            }
-        elif action == 'recommend_from_spotify':
-            spotify_track_id = request_data.get('spotify_track_id')
-            k = request_data.get('k', 10)
-            recommendations = recommend_from_spotify_track(spotify_track_id, k)
-            response = {
-                'status': 'success',
-                'recommendations': recommendations
-            }
-        else:
-            response = {
-                'status': 'error',
-                'message': 'Invalid action'
-            }
-        
-        # Send the response back to the client
-        client_socket.send(json.dumps(response).encode('utf-8'))
-    except Exception as e:
-        logging.error(f"Error handling client: {e}")
-    finally:
-        client_socket.close()
-        logging.info("Client connection closed.")
-        logging.info("Waiting for new connections...")
-        # Close the client socket
-        client_socket.close()
-
-while True:
-    try:
-        # Accept a new client connection
-        client_socket, addr = server_socket.accept()
-        logging.info(f"Accepted connection from {addr}")
-        
-        # Handle the client in a separate thread or process
-        handle_client(client_socket)
-    except KeyboardInterrupt:
-        logging.info("Server shutting down.")
-        break
-    except Exception as e:
-        logging.error(f"Error: {e}")
-    finally:
-        # Close the server socket
-        server_socket.close()
-        logging.info("Server socket closed.")
-        logging.info("Server stopped.")
+def start_recommendation_server(host='localhost', port=8765):
+    """
+    Start a socket server to handle recommendation requests from the frontend
+    """
+    # Create socket
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
+    try:
+        # Bind and listen
+        server_socket.bind((host, port))
+        server_socket.listen(5)
+        print(f"Recommendation server listening on {host}:{port}")
+        
+        while True:
+            # Accept client connection
+            client_socket, addr = server_socket.accept()
+            print(f"Connection from {addr}")
+            
+            # Handle client in a separate thread
+            client_thread = threading.Thread(
+                target=handle_client_request,
+                args=(client_socket,)
+            )
+            client_thread.daemon = True
+            client_thread.start()
+            
+    except KeyboardInterrupt:
+        print("Server shutting down...")
+    except Exception as e:
+        print(f"Server error: {e}")
+    finally:
+        server_socket.close()
+
+def handle_client_request(client_socket):
+    """Handle a single client request"""
+    try:
+        # Receive data
+        data = b""
+        while True:
+            chunk = client_socket.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            
+            # Check if we've received a complete JSON object
+            try:
+                json.loads(data.decode('utf-8'))
+                break  # If valid JSON, we've received the full message
+            except json.JSONDecodeError:
+                continue  # Not a complete JSON object yet, keep receiving
+        
+        if not data:
+            return
+            
+        # Parse request
+        request = json.loads(data.decode('utf-8'))
+        print(f"Received request: {request}")
+        
+        # Extract method and songs
+        method = request.get('method', 'Auto')
+        songs = request.get('songs', [])
+        
+        # Generate recommendations based on method and songs
+        recommendations = generate_recommendations(method, songs)
+        
+        # Convert NumPy types to native Python types for JSON serialization
+        serializable_recommendations = []
+        for rec in recommendations:
+            clean_rec = {}
+            for key, value in rec.items():
+                # Convert NumPy types to native Python types
+                if isinstance(value, np.integer):
+                    clean_rec[key] = int(value)
+                elif isinstance(value, np.floating):
+                    clean_rec[key] = float(value)
+                elif isinstance(value, np.ndarray):
+                    clean_rec[key] = value.tolist()
+                else:
+                    clean_rec[key] = value
+            serializable_recommendations.append(clean_rec)
+        
+        # Send response
+        response = json.dumps(serializable_recommendations).encode('utf-8')
+        client_socket.sendall(response)
+        print(f"Sent {len(serializable_recommendations)} recommendations")
+        
+    except Exception as e:
+        print(f"Error handling client request: {e}")
+        # Send error response
+        try:
+            error_msg = json.dumps({"error": str(e)}).encode('utf-8')
+            client_socket.sendall(error_msg)
+        except:
+            pass
+    finally:
+        client_socket.close()
+
+def generate_recommendations(method, songs):
+    """
+    Generate recommendations based on the method and input songs
+    
+    Args:
+        method: String representing the recommendation method
+        songs: List of dictionaries with song id and rating
+        
+    Returns:
+        List of recommended song dictionaries
+    """
+    print(f"Generating recommendations using {method}")
+    print(f"Using {len(songs)} song(s) as input")
+    
+    recommendations = []
+    
+    # If no songs selected, return empty list
+    if not songs:
+        return []
+    
+    # Sort songs by rating (highest first)
+    seed_songs = sorted(songs, key=lambda x: x.get('rating', 0), reverse=True)
+    
+    # Check how many songs from input are in our database
+    matching_songs = [song for song in seed_songs if song['id'] in track_data['track_id'].values]
+    print(f"Found {len(matching_songs)} matching songs in our database")
+    
+    if method == "Two Tower Deep Retrieval":
+        # Use our deep learning model if we have matching songs
+        if matching_songs:
+            for song in matching_songs[:3]:  # Use top 3 rated songs
+                song_id = song['id']
+                # Get recommendations using our model
+                model_recs = get_recommendations(song_id, k=7)
+                
+                # Add to results if not already there
+                for rec in model_recs:
+                    if not any(r.get('id') == rec.get('track_id') for r in recommendations):
+                        # Format for frontend
+                        recommendations.append({
+                            'id': rec.get('track_id'),
+                            'name': rec.get('name'),
+                            'artist': rec.get('artist'),
+                            'year': rec.get('year'),
+                            'popularity': rec.get('popularity', 0),
+                            'image_url': None  # Frontend will generate placeholder
+                        })
+                
+                # Limit to 20 total recommendations
+                if len(recommendations) >= 20:
+                    break
+        
+        # If we don't have enough recommendations yet, add some random popular songs
+        if len(recommendations) < 20:
+            print(f"Adding {20 - len(recommendations)} random popular songs")
+            # Get popular songs from our database
+            popular_songs = track_data.sort_values('popularity', ascending=False).head(40)
+            sample_indices = np.random.choice(len(popular_songs), min(20 - len(recommendations), len(popular_songs)), replace=False)
+            
+            for idx in sample_indices:
+                song = popular_songs.iloc[idx]
+                recommendations.append({
+                    'id': song['track_id'],
+                    'name': song['name'],
+                    'artist': song['artist_main'],
+                    'year': str(song['year']),
+                    'popularity': float(song['popularity']),
+                    'image_url': None
+                })
+                
+    elif method == "Collaborative Filtering":
+        # For demo, return some random songs from the dataset
+        sample_indices = np.random.choice(len(track_data), min(20, len(track_data)), replace=False)
+        
+        for idx in sample_indices:
+            song = track_data.iloc[idx]
+            recommendations.append({
+                'id': song['track_id'],
+                'name': song['name'],
+                'artist': song['artist_main'],
+                'year': str(song['year']),
+                'popularity': float(song['popularity']),
+                'image_url': None
+            })
+            
+    else:  # Auto - combine approaches
+        # Use our model for half the recommendations if we have matching songs
+        if matching_songs:
+            for song in matching_songs[:2]:
+                song_recs = get_recommendations(song['id'], k=5)
+                for rec in song_recs:
+                    if len(recommendations) < 10 and not any(r.get('id') == rec.get('track_id') for r in recommendations):
+                        recommendations.append({
+                            'id': rec.get('track_id'),
+                            'name': rec.get('name'),
+                            'artist': rec.get('artist'),
+                            'year': rec.get('year'),
+                            'popularity': rec.get('popularity', 0),
+                            'image_url': None
+                        })
+        
+        # Fill remaining slots with random songs
+        remaining = 20 - len(recommendations)
+        if remaining > 0:
+            sample_indices = np.random.choice(len(track_data), remaining, replace=False)
+            for idx in sample_indices:
+                song = track_data.iloc[idx]
+                recommendations.append({
+                    'id': song['track_id'],
+                    'name': song['name'],
+                    'artist': song['artist_main'],
+                    'year': str(song['year']),
+                    'popularity': float(song['popularity']),
+                    'image_url': None
+                })
+    
+    print(f"Returning {len(recommendations)} recommendations")
+    # Limit to 20 recommendations
+    return recommendations[:20]
+
+# Start the server when this script is run directly
+print("Starting recommendation server...")
+start_recommendation_server()
+
+
+
