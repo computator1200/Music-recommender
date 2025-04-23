@@ -5,8 +5,10 @@ import tensorflow as tf
 import tensorflow_recommenders as tfrs
 import matplotlib.pyplot as plt
 import seaborn as sns
+import random
 from typing import Dict, Text
 import os
+from VAECF2 import MultVAE, setup_and_train, recommend_songs as vaecf_recommend_songs
 
 # Load the datasets
 track_data = pd.read_csv('data/data.csv')
@@ -18,6 +20,9 @@ artist_genre_data = pd.read_csv('data/data_w_genres.csv')
 print(f"Track data shape: {track_data.shape}")
 track_data.head()
 
+import threading  
+vaecf_lock  = threading.Lock()
+vaecf_model = None   
 # %%
 # Handle missing values
 track_data = track_data.fillna(0)
@@ -563,8 +568,8 @@ def recommend_from_spotify_track(spotify_track_id, k=10):
     
     # Get the recommended songs
     recommended_songs = []
-    for song_id in song_ids[0].numpy():
-        song_id_str = song_id.decode('utf-8')
+    for int_id in song_ids[0].numpy():
+        song_id_str = int_to_id[int(int_id)] #mobin chnage
         if song_id_str in track_data['track_id'].values:
             recommended_song = track_data[track_data['track_id'] == song_id_str].iloc[0]
             recommended_songs.append({
@@ -584,8 +589,350 @@ def recommend_from_spotify_track(spotify_track_id, k=10):
 # for i, rec in enumerate(spotify_recommendations, 1):
 #     print(f"{i}. {rec['name']} by {rec['artist']} ({rec['year']}) - Popularity: {rec['popularity']}")
 
+# Add global variable for VAECF model
+vaecf_model = None
 
-# Create a server loop to handle requests from the frontend
+# Add these at the top of your file with other global variables
+vaecf_base_model = None
+vaecf_data = None
+
+def initialize_vaecf_base():
+    """Initialize the base VAECF model once when server starts"""
+    global vaecf_base_model, vaecf_data
+    
+    try:
+        from VAECF2 import main as vaecf_main
+        # Load data once
+        R_train_norm, R_val_norm, num_items, idx2song, song2idx = vaecf_main()
+        vaecf_data = {
+            'R_train_norm': R_train_norm,
+            'R_val_norm': R_val_norm,
+            'num_items': num_items,
+            'idx2song': idx2song,
+            'song2idx': song2idx
+        }
+        
+        # Train base model once
+        print("Training base VAECF model...")
+        vaecf_base_model, _ = setup_and_train(
+            R_train_norm=R_train_norm,
+            R_val_norm=R_val_norm,
+            num_items=num_items,
+            idx2song=idx2song,
+            song2idx=song2idx,
+            batch_size=32,
+            epochs=200,
+            patience=15
+        )
+        print("Base VAECF model training completed!")
+        
+    except Exception as e:
+        print(f"Error initializing base VAECF model: {e}")
+        import traceback
+        traceback.print_exc()
+
+def get_vaecf_recommendations(selected_songs, k=20):
+    """Get recommendations using the VAECF model"""
+    global vaecf_base_model, vaecf_data
+    
+    try:
+        if vaecf_base_model is None or vaecf_data is None:
+            initialize_vaecf_base()
+        
+        # Create a user vector based on selected songs
+        user_vector = np.zeros((1, vaecf_data['num_items']))
+        high_rated_songs = []
+        
+        # Collect high-rated songs and create user vector
+        for song in selected_songs:
+            song_id = song['id']
+            if song_id in track_data['id'].values:
+                song_name = track_data[track_data['id'] == song_id]['name'].iloc[0].lower().strip()
+                if song_name in vaecf_data['song2idx']:
+                    idx = vaecf_data['song2idx'][song_name]
+                    rating = song['rating'] / 10.0  # Normalize rating to 0-1
+                    user_vector[0, idx] = rating
+                    
+                    # Keep track of high-rated songs
+                    if song['rating'] >= 7:
+                        song_data = track_data[track_data['id'] == song_id].iloc[0]
+                        high_rated_songs.append({
+                            'name': song_data['name'],
+                            'artist': song_data['artist_main'],
+                            'features': {
+                                'acousticness': song_data['acousticness'],
+                                'danceability': song_data['danceability'],
+                                'energy': song_data['energy'],
+                                'instrumentalness': song_data['instrumentalness'],
+                                'valence': song_data['valence']
+                            }
+                        })
+        
+        # Get main recommendations from VAE
+        recommended_songs, scores = vaecf_recommend_songs(
+            vaecf_base_model,
+            user_vector,
+            vaecf_data['num_items'],
+            vaecf_data['idx2song'],
+            top_n=k-3  # Get 3 less than needed to make room for similar songs
+        )
+        
+        # Format main recommendations
+        main_recommendations = []
+        for song_id, score in zip(recommended_songs, scores):
+            if song_id in track_data['id'].values:
+                song = track_data[track_data['id'] == song_id].iloc[0]
+                main_recommendations.append({
+                    'id': song_id,
+                    'name': song['name'],
+                    'artist': song['artist_main'],
+                    'year': str(song['year']),
+                    'popularity': float(song['popularity']),
+                    'image_url': None
+                })
+        
+        # Find similar songs from training data for high-rated songs
+        similar_songs = []
+        if high_rated_songs:
+            # Create a pool of potential similar songs
+            potential_songs = track_data.sample(n=min(1000, len(track_data)))
+            
+            for _, potential_song in potential_songs.iterrows():
+                for high_rated_song in high_rated_songs:
+                    # Calculate similarity based on audio features
+                    similarity_score = 0
+                    for feature in ['acousticness', 'danceability', 'energy', 'instrumentalness', 'valence']:
+                        similarity_score += abs(potential_song[feature] - high_rated_song['features'][feature])
+                    
+                    # Add some randomness to similarity
+                    similarity_score += np.random.normal(0, 0.1)
+                    
+                    similar_songs.append({
+                        'id': potential_song['id'],
+                        'name': potential_song['name'],
+                        'artist': potential_song['artist_main'],
+                        'year': str(potential_song['year']),
+                        'popularity': float(potential_song['popularity']),
+                        'image_url': None,
+                        'similarity': -similarity_score  # Negative because lower difference means more similar
+                    })
+        
+        # Sort similar songs by similarity and get top 3 random ones
+        if similar_songs:
+            similar_songs.sort(key=lambda x: x['similarity'], reverse=True)
+            # Take random songs from top 20 similar songs
+            top_similar = similar_songs[:20]
+            random_similar = random.sample(top_similar, min(3, len(top_similar)))
+            # Remove similarity score
+            random_similar = [{k: v for k, v in song.items() if k != 'similarity'} for song in random_similar]
+        else:
+            random_similar = []
+        
+        # Combine recommendations
+        final_recommendations = main_recommendations + random_similar
+        
+        # Randomize the order of all recommendations
+        random.shuffle(final_recommendations)
+        
+        print(f"Generated {len(main_recommendations)} VAE recommendations and {len(random_similar)} similar song recommendations")
+        return final_recommendations
+        
+    except Exception as e:
+        print(f"Error getting VAECF recommendations: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+# Modify the generate_recommendations function to include VAECF
+def generate_recommendations(method, songs):
+    """
+    Generate recommendations based on the method and input songs
+    """
+    print(f"Generating recommendations using {method}")
+    print(f"Using {len(songs)} song(s) as input")
+    
+    recommendations = []
+    
+    if not songs:
+        print("No songs provided")
+        return []
+    
+    # Sort songs by rating (highest first)
+    seed_songs = sorted(songs, key=lambda x: x.get('rating', 0), reverse=True)
+    
+    # Check how many songs from input are in our database
+    matching_songs = [song for song in seed_songs if song['id'] in track_data['id'].values]
+    print(f"Found {len(matching_songs)} matching songs in our database")
+    
+    if method == "Two Tower Deep Retrieval":
+        # Use our deep learning model if we have matching songs
+        if matching_songs:
+            # Increase k for each song to get more candidates
+            k_per_song = max(10, 20 // len(matching_songs[:3]))
+            
+            for song in matching_songs[:3]:  # Use top 3 rated songs
+                song_id = song['id']
+                track_row = track_data[track_data['id'] == song_id]
+                if not track_row.empty:
+                    track_id = track_row['track_id'].iloc[0]
+                    # Get more recommendations per song
+                    model_recs = get_recommendations(track_id, k=k_per_song)
+                    
+                    # Add to results if not already there
+                    for rec in model_recs:
+                        if not any(r.get('id') == rec.get('track_id') for r in recommendations):
+                            recommendations.append({
+                                'id': rec.get('track_id'),
+                                'name': rec.get('name'),
+                                'artist': rec.get('artist'),
+                                'year': rec.get('year'),
+                                'popularity': rec.get('popularity', 0),
+                                'image_url': None
+                            })
+                            
+                    # If we have enough recommendations, break
+                    if len(recommendations) >= 20:
+                        break
+            
+            # If we still don't have enough, try getting more from remaining songs
+            if len(recommendations) < 20 and len(matching_songs) > 3:
+                for song in matching_songs[3:]:
+                    song_id = song['id']
+                    track_row = track_data[track_data['id'] == song_id]
+                    if not track_row.empty:
+                        track_id = track_row['track_id'].iloc[0]
+                        model_recs = get_recommendations(track_id, k=5)
+                        
+                        for rec in model_recs:
+                            if not any(r.get('id') == rec.get('track_id') for r in recommendations):
+                                recommendations.append({
+                                    'id': rec.get('track_id'),
+                                    'name': rec.get('name'),
+                                    'artist': rec.get('artist'),
+                                    'year': rec.get('year'),
+                                    'popularity': rec.get('popularity', 0),
+                                    'image_url': None
+                                })
+                                
+                            if len(recommendations) >= 20:
+                                break
+                    if len(recommendations) >= 20:
+                        break
+                        
+    elif method == "Collaborative Filtering":
+        print("Using VAECF model for recommendations")
+        # Request more recommendations than needed to account for filtering
+        recommendations = get_vaecf_recommendations(matching_songs, k=30)
+        print(f"VAECF returned {len(recommendations)} recommendations")
+            
+    else:  # Auto - combine approaches
+        print("Using Auto mode - combining both models...")
+        
+        # Get recommendations from both models in parallel
+        two_tower_recs = []
+        if matching_songs:
+            # Use top 2 rated songs for Two Tower model
+            k_per_song = 7  # Fixed number per song to get ~14 recommendations
+            for song in matching_songs[:2]:
+                song_id = song['id']
+                track_row = track_data[track_data['id'] == song_id]
+                if not track_row.empty:
+                    track_id = track_row['track_id'].iloc[0]
+                    song_recs = get_recommendations(track_id, k=k_per_song)
+                    for rec in song_recs:
+                        if not any(r.get('id') == rec.get('track_id') for r in two_tower_recs):
+                            two_tower_recs.append({
+                                'id': rec.get('track_id'),
+                                'name': rec.get('name'),
+                                'artist': rec.get('artist'),
+                                'year': rec.get('year'),
+                                'popularity': rec.get('popularity', 0),
+                                'image_url': None
+                            })
+        
+        # Get VAECF recommendations
+        vaecf_recs = get_vaecf_recommendations(matching_songs, k=14)  # Get ~14 recommendations
+        
+        # Interleave recommendations from both models
+        recommendations = []
+        two_tower_idx = 0
+        vaecf_idx = 0
+        
+        while len(recommendations) < 20:
+            # Add Two Tower recommendation if available
+            if two_tower_idx < len(two_tower_recs):
+                rec = two_tower_recs[two_tower_idx]
+                if not any(r.get('id') == rec.get('id') for r in recommendations):
+                    recommendations.append(rec)
+                two_tower_idx += 1
+            
+            # Add VAECF recommendation if available
+            if vaecf_idx < len(vaecf_recs):
+                rec = vaecf_recs[vaecf_idx]
+                if not any(r.get('id') == rec.get('id') for r in recommendations):
+                    recommendations.append(rec)
+                vaecf_idx += 1
+            
+            # If both indices are exhausted and we still need more recommendations
+            if (two_tower_idx >= len(two_tower_recs) and 
+                vaecf_idx >= len(vaecf_recs) and 
+                len(recommendations) < 20):
+                # Get additional recommendations from remaining matching songs
+                if len(matching_songs) > 2:
+                    for song in matching_songs[2:]:
+                        if len(recommendations) >= 20:
+                            break
+                        song_id = song['id']
+                        track_row = track_data[track_data['id'] == song_id]
+                        if not track_row.empty:
+                            track_id = track_row['track_id'].iloc[0]
+                            additional_recs = get_recommendations(track_id, k=5)
+                            for rec in additional_recs:
+                                if not any(r.get('id') == rec.get('track_id') for r in recommendations):
+                                    recommendations.append({
+                                        'id': rec.get('track_id'),
+                                        'name': rec.get('name'),
+                                        'artist': rec.get('artist'),
+                                        'year': rec.get('year'),
+                                        'popularity': rec.get('popularity', 0),
+                                        'image_url': None
+                                    })
+                                if len(recommendations) >= 20:
+                                    break
+                break
+    
+    print(f"Generated {len(recommendations)} recommendations")
+    
+    # If we still don't have enough recommendations, try to get more from random songs
+    if len(recommendations) < 20:
+        print(f"Only got {len(recommendations)} recommendations, attempting to get more...")
+        additional_needed = 20 - len(recommendations)
+        
+        # Get recommendations from random songs in our database
+        random_songs = track_data.sample(n=min(3, additional_needed)).to_dict('records')
+        for song in random_songs:
+            if len(recommendations) >= 20:
+                break
+                
+            recs = get_recommendations(song['track_id'], k=additional_needed)
+            for rec in recs:
+                if not any(r.get('id') == rec.get('track_id') for r in recommendations):
+                    recommendations.append({
+                        'id': rec.get('track_id'),
+                        'name': rec.get('name'),
+                        'artist': rec.get('artist'),
+                        'year': rec.get('year'),
+                        'popularity': rec.get('popularity', 0),
+                        'image_url': None
+                    })
+                    if len(recommendations) >= 20:
+                        break
+    
+    print(f"Returning {len(recommendations)} recommendations")
+    return recommendations[:20]
+
+# Initialize VAECF model when starting the server
+print("Starting recommendation server...")
 
 import socket
 import json
@@ -689,128 +1036,7 @@ def handle_client_request(client_socket):
     finally:
         client_socket.close()
 
-def generate_recommendations(method, songs):
-    """
-    Generate recommendations based on the method and input songs
-    
-    Args:
-        method: String representing the recommendation method
-        songs: List of dictionaries with song id and rating
-        
-    Returns:
-        List of recommended song dictionaries
-    """
-    print(f"Generating recommendations using {method}")
-    print(f"Using {len(songs)} song(s) as input")
-    
-    recommendations = []
-    
-    # If no songs selected, return empty list
-    if not songs:
-        return []
-    
-    # Sort songs by rating (highest first)
-    seed_songs = sorted(songs, key=lambda x: x.get('rating', 0), reverse=True)
-    
-    # Check how many songs from input are in our database
-    matching_songs = [song for song in seed_songs if song['id'] in track_data['track_id'].values]
-    print(f"Found {len(matching_songs)} matching songs in our database")
-    
-    if method == "Two Tower Deep Retrieval":
-        # Use our deep learning model if we have matching songs
-        if matching_songs:
-            for song in matching_songs[:3]:  # Use top 3 rated songs
-                song_id = song['id']
-                # Get recommendations using our model
-                model_recs = get_recommendations(song_id, k=7)
-                
-                # Add to results if not already there
-                for rec in model_recs:
-                    if not any(r.get('id') == rec.get('track_id') for r in recommendations):
-                        # Format for frontend
-                        recommendations.append({
-                            'id': rec.get('track_id'),
-                            'name': rec.get('name'),
-                            'artist': rec.get('artist'),
-                            'year': rec.get('year'),
-                            'popularity': rec.get('popularity', 0),
-                            'image_url': None  # Frontend will generate placeholder
-                        })
-                
-                # Limit to 20 total recommendations
-                if len(recommendations) >= 20:
-                    break
-        
-        # If we don't have enough recommendations yet, add some random popular songs
-        if len(recommendations) < 20:
-            print(f"Adding {20 - len(recommendations)} random popular songs")
-            # Get popular songs from our database
-            popular_songs = track_data.sort_values('popularity', ascending=False).head(40)
-            sample_indices = np.random.choice(len(popular_songs), min(20 - len(recommendations), len(popular_songs)), replace=False)
-            
-            for idx in sample_indices:
-                song = popular_songs.iloc[idx]
-                recommendations.append({
-                    'id': song['track_id'],
-                    'name': song['name'],
-                    'artist': song['artist_main'],
-                    'year': str(song['year']),
-                    'popularity': float(song['popularity']),
-                    'image_url': None
-                })
-                
-    elif method == "Collaborative Filtering":
-        # For demo, return some random songs from the dataset
-        sample_indices = np.random.choice(len(track_data), min(20, len(track_data)), replace=False)
-        
-        for idx in sample_indices:
-            song = track_data.iloc[idx]
-            recommendations.append({
-                'id': song['track_id'],
-                'name': song['name'],
-                'artist': song['artist_main'],
-                'year': str(song['year']),
-                'popularity': float(song['popularity']),
-                'image_url': None
-            })
-            
-    else:  # Auto - combine approaches
-        # Use our model for half the recommendations if we have matching songs
-        if matching_songs:
-            for song in matching_songs[:2]:
-                song_recs = get_recommendations(song['id'], k=5)
-                for rec in song_recs:
-                    if len(recommendations) < 10 and not any(r.get('id') == rec.get('track_id') for r in recommendations):
-                        recommendations.append({
-                            'id': rec.get('track_id'),
-                            'name': rec.get('name'),
-                            'artist': rec.get('artist'),
-                            'year': rec.get('year'),
-                            'popularity': rec.get('popularity', 0),
-                            'image_url': None
-                        })
-        
-        # Fill remaining slots with random songs
-        remaining = 20 - len(recommendations)
-        if remaining > 0:
-            sample_indices = np.random.choice(len(track_data), remaining, replace=False)
-            for idx in sample_indices:
-                song = track_data.iloc[idx]
-                recommendations.append({
-                    'id': song['track_id'],
-                    'name': song['name'],
-                    'artist': song['artist_main'],
-                    'year': str(song['year']),
-                    'popularity': float(song['popularity']),
-                    'image_url': None
-                })
-    
-    print(f"Returning {len(recommendations)} recommendations")
-    # Limit to 20 recommendations
-    return recommendations[:20]
-
 # Start the server when this script is run directly
-print("Starting recommendation server...")
 start_recommendation_server()
 
 
