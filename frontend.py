@@ -441,6 +441,8 @@ def main():
                 
                 # Send to recommendation server and get results
                 with st.spinner("Getting recommendations from server..."):
+                    if method == "Collaborative Filtering":
+                        st.info("First time using Collaborative Filtering? This might take a bit longer as the model initializes...")
                     recommendations = get_recommendations_from_server(method, selected_songs)
                 
                 if recommendations:
